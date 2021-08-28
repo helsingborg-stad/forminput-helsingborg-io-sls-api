@@ -2,7 +2,6 @@ service: navet-ms
 
 plugins:
   - serverless-bundle
-  - serverless-offline
 
 custom: ${file(../../serverless.common.yml):custom}
 
