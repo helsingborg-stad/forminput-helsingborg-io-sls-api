@@ -21,7 +21,15 @@ const encryptedAnswers = Joi.object({
   encryptedAnswers: Joi.string(),
 });
 
-const encryption = Joi.object({ type: Joi.string() });
+const encryption = Joi.object({
+  type: Joi.string().required(),
+  symmetricKeyName: Joi.string(),
+  primes: Joi.object({
+    P: Joi.number(),
+    G: Joi.number(),
+  }),
+  publicKeys: Joi.object().pattern(/^/, [Joi.string()]),
+});
 
 const formCurrentPosition = Joi.object({
   index: Joi.number().required(),
