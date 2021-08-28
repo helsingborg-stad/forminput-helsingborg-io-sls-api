@@ -1,78 +1,106 @@
 /* eslint-disable no-console */
 import to from 'await-to-js';
-import { throwError } from '@helsingborg-stad/npm-api-error-handling';
+import { InternalServerError, UnauthorizedError } from '@helsingborg-stad/npm-api-error-handling';
 
 import config from '../../../config';
 import params from '../../../libs/params';
 import { parseXml, parseErrorMessageFromXML, parseJSON } from '../helpers/parser';
-import { client } from '../helpers/client';
+import getNavetRequestClient from '../helpers/client';
 import { putEvent } from '../../../libs/awsEventBridge';
 import * as request from '../../../libs/request';
-import * as response from '../../../libs/response';
 
-const SSMParams = params.read(config.navet.envsKeyName);
+const NAVET_PARAMS = params.read(config.navet.envsKeyName);
 
-export const main = async event => {
+export async function main(event) {
   const { user } = event.detail;
-  const navetSSMparams = await SSMParams;
-  navetSSMparams.personalNumber = user.personalNumber;
-  const xml = parseXml(navetSSMparams);
 
-  const [err, navetResponse] = await to(requestNavetUser(xml, navetSSMparams));
-  if (err) return response.failure(err);
-  await putEvent(createNavetPollEventDetail(navetResponse), 'NavetPoll', 'navet.poll');
-  return;
-};
+  const [requestNavetUserError, navetUser] = await to(requestNavetUser(user.personalNumber));
+  if (requestNavetUserError) {
+    return console.error('(Navet-ms)', requestNavetUserError);
+  }
 
-function createNavetPollEventDetail(navetData) {
-  const userObj = {
-    personalNumber: navetData.PersonId.PersonNr,
-    firstName: navetData.Namn.Fornamn,
-    lastName: navetData.Namn.Efternamn,
-    address: {
-      street: navetData.Adresser.Folkbokforingsadress.Utdelningsadress2,
-      postalCode: navetData.Adresser.Folkbokforingsadress.PostNr,
-      city: navetData.Adresser.Folkbokforingsadress.Postort,
-    },
-    civilStatus: navetData.Civilstand.CivilstandKod,
-  };
-  return userObj;
+  const eventDetail = getNavetPollEventDetail(navetUser);
+  await putEvent(eventDetail, 'NavetPoll', 'navet.poll');
+
+  return true;
 }
 
-async function requestNavetUser(payload, params) {
-  let err, navetClient, navetUser, parsedData;
+function getNavetPollEventDetail(navetUser) {
+  const eventDetail = {
+    personalNumber: navetUser.PersonId.PersonNr,
+    firstName: navetUser.Namn.Fornamn,
+    lastName: navetUser.Namn.Efternamn,
+    address: {
+      street: navetUser.Adresser.Folkbokforingsadress.Utdelningsadress2,
+      postalCode: navetUser.Adresser.Folkbokforingsadress.PostNr,
+      city: navetUser.Adresser.Folkbokforingsadress.Postort,
+    },
+    civilStatus: navetUser.Civilstand.CivilstandKod,
+  };
 
-  // Create HTTP client
-  [err, navetClient] = await to(client(params));
-  if (!navetClient) throwError(503);
+  return eventDetail;
+}
 
-  // Get user from Navet API
-  [err, navetUser] = await to(
-    request.call(navetClient, 'post', params.personpostXmlEndpoint, payload)
+async function requestNavetUser(personalNumber) {
+  const ssmParams = await NAVET_PARAMS;
+  ssmParams.personalNumber = personalNumber;
+
+  const [getNavetClientError, navetRequestClient] = await to(getNavetRequestClient(ssmParams));
+  if (getNavetClientError) {
+    throw getNavetClientError;
+  }
+
+  const navetPostRequestXmlPayload = parseXml(ssmParams);
+
+  const [postNavetClientError, navetUser] = await to(
+    request.call(
+      navetRequestClient,
+      'post',
+      ssmParams.personpostXmlEndpoint,
+      navetPostRequestXmlPayload
+    )
   );
-  if (err) {
-    // Parse Error Message from XML.
-    const [, parsedErrorMessage] = await to(parseErrorMessageFromXML(err.response.data));
-    throwError(err.response.status, parsedErrorMessage || null);
+  if (postNavetClientError) {
+    if (postNavetClientError.response) {
+      const [, navetResponseXmlErrorMessage] = await to(
+        parseErrorMessageFromXML(postNavetClientError.response.data)
+      );
+
+      throw navetResponseXmlErrorMessage;
+    }
+
+    throw postNavetClientError;
   }
 
-  // Parse XML data to JSON
-  [err, parsedData] = await to(parseJSON(navetUser.data));
-  if (err) throwError(500);
+  return await getNavetUserPersonPostAsJson(navetUser);
+}
 
-  const { Folkbokforingspost } = parsedData;
-
-  // Abort if user data is confidential
-  if (
-    Folkbokforingspost.Sekretessmarkering === 'J' ||
-    Folkbokforingspost.SkyddadFolkbokforing === 'J'
-  ) {
-    throw new Error('User is not allowed to use the service.');
+async function getNavetUserPersonPostAsJson(navetUser) {
+  const [parseJsonError, navetUserJson] = await to(parseJSON(navetUser.data));
+  if (parseJsonError) {
+    throw parseJsonError;
   }
 
-  // Collect the user data from response
-  const navetUserData = Folkbokforingspost.Personpost;
-  if (navetUserData === undefined) throwError(500);
+  const { Folkbokforingspost } = navetUserJson;
+  if (Folkbokforingspost.Personpost === undefined) {
+    throw new InternalServerError();
+  }
 
-  return navetUserData;
+  if (isUserConfidential(navetUserJson)) {
+    throw new UnauthorizedError();
+  }
+
+  return Folkbokforingspost.Personpost;
+}
+
+function isUserConfidential(navetUser) {
+  const {
+    Folkbokforingspost: { Sekretessmarkering, SkyddadFolkbokforing },
+  } = navetUser;
+
+  if (Sekretessmarkering === 'J' || SkyddadFolkbokforing === 'J') {
+    return true;
+  }
+
+  return false;
 }
