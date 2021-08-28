@@ -16,7 +16,6 @@ provider:
   region: eu-north-1
   endpointType: regional
   tracing:
-    apiGateway: true
     lambda: true
 
   environment:
